@@ -4,13 +4,12 @@
 
 
 ## Basic Details
-### Team Name: roqcodes
+### Team Name: 404
 
 
 ### Team Members
-- Team Lead: Muhammed Ronak - SOE CUSAT
-- Member 2: Muhammed Danish - SOE CUSAT
-- Member 3: Mohammed Ramzan - SOE CUSAT
+- Team Lead: Muhammed Danish - SOE CUSAT
+- Member 2: Muhammed Rihan - SOE CUSAT
 
 ### Project Description
 A delightfully over-engineered AI computer vision application that tracks how many times you blink your eyes and yawn throughout your day, keeping a permanent scorecard of your facial fatigue.
@@ -95,9 +94,8 @@ Webcam Video Stream (OpenCV 30 FPS)
 -> Local SQLite Storage (`data/blink_history.db`) -> History Table & CSV Exporter
 
 ## Team Contributions
-- Muhammed Ronak: Researched MediaPipe FaceLandmarker blendshapes, neural blink debouncing algorithms, and audio cues.
-- Muhammed Danish: Built the multi-threaded CustomTkinter desktop GUI, 400px metrics cards, and SQLite storage manager with CSV exporter.
-- Mohammed Ramzan: Engineered the speech-immune ensemble yawn detection logic (MAR + jawOpen + continuous hold) and UI styling.
+- Muhammed Rihan: Researched MediaPipe FaceLandmarker blendshapes, neural blink debouncing algorithms, and audio cues.
+- Muhammed Danish: Built the multi-threaded CustomTkinter desktop GUI, 400px metrics cards, and SQLite storage manager with CSV exporter, Engineered the speech-immune ensemble yawn detection logic (MAR + jawOpen + continuous hold) and UI styling.
 ---
 Made with ❤️ at TinkerHub Useless Projects 
 
