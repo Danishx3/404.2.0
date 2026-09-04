@@ -44,18 +44,26 @@ except ImportError:
 MODEL_FILENAME = "face_landmarker.task"
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
 
-# Face Mesh Landmark Indices for Eyes & Irises
+# Face Mesh Landmark Indices for Eyes, Irises & Mouth
 LEFT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 RIGHT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
 LEFT_IRIS = [468, 469, 470, 471, 472]
 RIGHT_IRIS = [473, 474, 475, 476, 477]
+LIPS_OUTER = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146]
+LIPS_INNER = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]
 
-# Default Blink Thresholds (Blendshapes range 0.0 = wide open, 1.0 = fully closed)
+# Default Blink & Yawn Thresholds
 DEFAULT_CLOSE_THRESHOLD = 0.48
 DEFAULT_OPEN_THRESHOLD = 0.22
-MIN_BLINK_DURATION_MS = 60    # Ignore micro-jitters
+MIN_BLINK_DURATION_MS = 40    # Ignore micro-jitters
 MAX_BLINK_DURATION_MS = 600   # Avoid counting prolonged eyes-closed as repeated blinks
 STARE_ALERT_SECONDS = 12.0    # Warn user about dry eyes if no blink for > 12s
+
+# Yawn Detection Configuration (Speech-Immune Ensemble MAR + Blendshape)
+DEFAULT_YAWN_THRESHOLD = 0.58       # Wide jaw opening required (speech is 0.15 - 0.35)
+DEFAULT_YAWN_CLOSE_THRESHOLD = 0.35 # Reset when mouth returns to normal
+MIN_YAWN_HOLD_SEC = 1.30            # Continuous hold time (speech never holds wide for 1.3s)
+MAX_YAWN_DURATION_SEC = 9.0         # Max valid yawn duration
 
 # Palette (BGR)
 COLOR_BG_CARD = (22, 25, 34)
@@ -107,6 +115,9 @@ class SoundFeedback:
                         winsound.Beep(1400, 35)  # Crisp high blip
                     elif sound_type == 'wink':
                         winsound.Beep(950, 45)   # Lower blip
+                    elif sound_type == 'yawn':
+                        winsound.Beep(520, 80)
+                        winsound.Beep(680, 130)  # Gentle melodic two-tone chime
                     elif sound_type == 'alert':
                         winsound.Beep(650, 120)  # Gentle warning tone
                 except Exception:
@@ -126,19 +137,57 @@ class SoundFeedback:
         return self.enabled
 
 
+def compute_mouth_metrics(landmarks, raw_jaw_score):
+    """
+    Computes Mouth Aspect Ratio (MAR) and combined mouth openness score (0.0 to 1.0)
+    using both MediaPipe neural blendshape and geometric lip distance.
+    """
+    mar = 0.0
+    if landmarks and len(landmarks) > 0:
+        face = landmarks[0]
+        if len(face) > 291:
+            p13 = np.array([face[13].x, face[13].y])
+            p14 = np.array([face[14].x, face[14].y])
+            p61 = np.array([face[61].x, face[61].y])
+            p291 = np.array([face[291].x, face[291].y])
+            h_dist = float(np.linalg.norm(p61 - p291))
+            if h_dist > 1e-5:
+                # Raw inner MAR: ~0.02 closed, 0.15 - 0.32 talking, 0.55 - 0.90 yawning
+                raw_mar = float(np.linalg.norm(p13 - p14)) / h_dist
+                mar = raw_mar * 1.10  # Conversational speech stays below 0.38
+
+    jaw_val = float(raw_jaw_score) if raw_jaw_score is not None else 0.0
+    combined = max(jaw_val, mar)
+    return min(1.0, max(0.0, combined)), mar
+
+
 # ==============================================================================
-# Eye Blink & Ergonomics Tracker
+# Eye Blink, Yawn & Ergonomics Tracker
 # ==============================================================================
 class BlinkTracker:
-    """Tracks blink events, winks, blink rate (BPM), and eye fatigue."""
+    """Tracks blink events, winks, yawns, blink rate (BPM), and drowsiness."""
     def __init__(self, close_threshold=DEFAULT_CLOSE_THRESHOLD, open_threshold=DEFAULT_OPEN_THRESHOLD):
         self.close_threshold = close_threshold
         self.open_threshold = open_threshold
 
-        # Counters
+        # Yawn Tracking Settings (Speech-Immune Ensemble MAR + Blendshape)
+        self.yawn_enabled = True
+        self.yawn_threshold = DEFAULT_YAWN_THRESHOLD
+        self.yawn_close_threshold = DEFAULT_YAWN_CLOSE_THRESHOLD
+        self.min_yawn_hold_sec = MIN_YAWN_HOLD_SEC
+
+        # Blink & Wink Counters
         self.total_blinks = 0
         self.left_winks = 0
         self.right_winks = 0
+
+        # Yawn Counters & States
+        self.total_yawns = 0
+        self.is_yawning = False
+        self.yawn_start_time = None
+        self.already_counted_yawn = False
+        self.yawn_pulse_frames = 0
+        self.last_yawn_time = None
 
         # State machine flags
         self.is_eyes_closed = False
@@ -159,6 +208,12 @@ class BlinkTracker:
         self.total_blinks = 0
         self.left_winks = 0
         self.right_winks = 0
+        self.total_yawns = 0
+        self.is_yawning = False
+        self.yawn_start_time = None
+        self.already_counted_yawn = False
+        self.yawn_pulse_frames = 0
+        self.last_yawn_time = None
         self.is_eyes_closed = False
         self.is_left_closed = False
         self.is_right_closed = False
@@ -170,17 +225,40 @@ class BlinkTracker:
         self.pulse_frames = 0
         self.last_state = "OPEN"
 
-    def update(self, left_score, right_score):
+    def update(self, left_score, right_score, mouth_score=None):
         """
-        Process single-frame left and right eyelid closure scores (0.0 to 1.0).
-        Returns: event string ("BLINK", "LEFT_WINK", "RIGHT_WINK", or None)
+        Process single-frame left/right eyelid closure scores and mouth openness.
+        Returns: event string ("BLINK", "YAWN", "LEFT_WINK", "RIGHT_WINK", or None)
         """
         now = time.time()
         event = None
 
+        # Process Yawning with speech-rejection and continuous hold requirement
+        if self.yawn_enabled and mouth_score is not None:
+            if mouth_score >= self.yawn_threshold:
+                if self.yawn_start_time is None:
+                    self.yawn_start_time = now
+                elif now - self.yawn_start_time >= self.min_yawn_hold_sec:
+                    self.is_yawning = True
+                    if not self.already_counted_yawn:
+                        self.total_yawns += 1
+                        self.last_yawn_time = now
+                        self.yawn_pulse_frames = 18
+                        self.already_counted_yawn = True
+                        event = "YAWN"
+            elif mouth_score < self.yawn_close_threshold:
+                self.is_yawning = False
+                self.yawn_start_time = None
+                self.already_counted_yawn = False
+            else:
+                # Mouth dipped below yawn threshold (speech oscillation):
+                # Reset hold timer immediately so speech syllables never accumulate!
+                if not self.is_yawning:
+                    self.yawn_start_time = None
+
         if left_score is None or right_score is None:
             self.closure_history.append(0.0)
-            return None
+            return event
 
         # Record combined closure score for rolling graph
         avg_closure = (left_score + right_score) / 2.0
@@ -213,12 +291,13 @@ class BlinkTracker:
                         self.last_blink_time = now
                         self.blink_timestamps.append(now)
                         self.pulse_frames = 9
-                        event = "BLINK"
+                        if event is None:
+                            event = "BLINK"
                 elif left_score > 0.75 and right_score > 0.75:
-                    # User is keeping eyes closed (prolonged close, don't count multiple times)
+                    # Prolonged eye closure (resting or dozing)
                     pass
                 else:
-                    # Partial opening, remain in closed state until fully opened
+                    # Partial opening
                     pass
 
         # Check for isolated winks (only if not in bilateral blink)
@@ -233,7 +312,8 @@ class BlinkTracker:
                 self.is_left_closed = False
                 if 50 <= wink_dur <= 900:
                     self.left_winks += 1
-                    event = "LEFT_WINK"
+                    if event is None:
+                        event = "LEFT_WINK"
 
             # Right Eye Wink
             if right_is_shut and not left_is_shut and left_score < self.open_threshold:
@@ -245,7 +325,8 @@ class BlinkTracker:
                 self.is_right_closed = False
                 if 50 <= wink_dur <= 900:
                     self.right_winks += 1
-                    event = "RIGHT_WINK"
+                    if event is None:
+                        event = "RIGHT_WINK"
 
         # Clean up timestamps older than 60s for BPM
         cutoff = now - 60.0
@@ -254,6 +335,8 @@ class BlinkTracker:
 
         if self.pulse_frames > 0:
             self.pulse_frames -= 1
+        if self.yawn_pulse_frames > 0:
+            self.yawn_pulse_frames -= 1
 
         return event
 
@@ -272,6 +355,16 @@ class BlinkTracker:
     def get_time_since_last_blink(self):
         """Elapsed seconds since the last registered blink."""
         return time.time() - self.last_blink_time
+
+    def get_drowsiness_status(self):
+        """Analyze blinks, yawns, and rate to determine alertness."""
+        bpm = self.get_bpm()
+        if self.total_yawns >= 3 or (self.total_yawns >= 1 and bpm < 8):
+            return "DROWSY (Take a break!)", COLOR_ACCENT_RED
+        elif self.total_yawns >= 1 or (bpm < 11 and bpm > 0):
+            return "TIRED (Slight fatigue)", COLOR_ACCENT_YELLOW
+        else:
+            return "ALERT & ATTENTIVE", COLOR_ACCENT_GREEN
 
 
 # ==============================================================================
@@ -300,24 +393,31 @@ class HUDDrawer:
             cv2.rectangle(frame, (x1, y1), (x2, y2), border_color, 1, cv2.LINE_AA)
 
     @staticmethod
-    def draw_progress_bar(frame, x, y, width, height, progress, label, color_open=COLOR_ACCENT_GREEN, color_closed=COLOR_ACCENT_RED):
-        """Renders an eye openness bar with dynamic color grading."""
+    def draw_progress_bar(frame, x, y, width, height, progress, label, color_open=COLOR_ACCENT_GREEN, color_closed=COLOR_ACCENT_RED, custom_color=None, threshold_pos=None):
+        """Renders an eye openness or jaw opening bar with dynamic color grading and threshold tick."""
         progress = max(0.0, min(1.0, progress))
         # Background slot
         cv2.rectangle(frame, (x, y), (x + width, y + height), (35, 40, 50), -1)
         cv2.rectangle(frame, (x, y), (x + width, y + height), (70, 80, 100), 1)
 
-        # Color interpolation based on openness (1.0 = open green, 0.0 = closed red)
         fill_w = int(width * progress)
-        if progress > 0.5:
-            bar_color = color_open
-        elif progress > 0.25:
-            bar_color = COLOR_ACCENT_YELLOW
+        if custom_color is not None:
+            bar_color = custom_color
         else:
-            bar_color = color_closed
+            if progress > 0.5:
+                bar_color = color_open
+            elif progress > 0.25:
+                bar_color = COLOR_ACCENT_YELLOW
+            else:
+                bar_color = color_closed
 
         if fill_w > 0:
             cv2.rectangle(frame, (x + 1, y + 1), (x + fill_w - 1, y + height - 1), bar_color, -1)
+
+        # Draw threshold indicator line if provided
+        if threshold_pos is not None and 0.0 < threshold_pos < 1.0:
+            tx = x + int(width * threshold_pos)
+            cv2.line(frame, (tx, y - 2), (tx, y + height + 2), (255, 120, 255), 2, cv2.LINE_AA)
 
         # Label and percentage text
         pct_text = f"{int(progress * 100)}%"
@@ -352,20 +452,20 @@ class HUDDrawer:
             cv2.line(frame, pt1, pt2, COLOR_ACCENT_CYAN, 2, cv2.LINE_AA)
 
     def draw_landmarks(self, frame, landmarks):
-        """Visualizes delicate cyber-contours around eyes and irises."""
+        """Visualizes delicate cyber-contours around eyes, irises, and mouth."""
         if landmarks is None or len(landmarks) == 0:
             return
 
         h, w = frame.shape[:2]
         face = landmarks[0]
 
-        # Left Eye Contour
-        left_pts = [(int(face[i].x * w), int(face[i].y * h)) for i in LEFT_EYE_CONTOUR]
+        # Left Eye Contour (Cyan / Gold)
+        left_pts = [(int(face[i].x * w), int(face[i].y * h)) for i in LEFT_EYE_CONTOUR if i < len(face)]
         if len(left_pts) > 2:
             cv2.polylines(frame, [np.array(left_pts, np.int32)], isClosed=True, color=(255, 230, 0), thickness=1, lineType=cv2.LINE_AA)
 
-        # Right Eye Contour
-        right_pts = [(int(face[i].x * w), int(face[i].y * h)) for i in RIGHT_EYE_CONTOUR]
+        # Right Eye Contour (Cyan / Gold)
+        right_pts = [(int(face[i].x * w), int(face[i].y * h)) for i in RIGHT_EYE_CONTOUR if i < len(face)]
         if len(right_pts) > 2:
             cv2.polylines(frame, [np.array(right_pts, np.int32)], isClosed=True, color=(255, 230, 0), thickness=1, lineType=cv2.LINE_AA)
 
@@ -377,7 +477,17 @@ class HUDDrawer:
                 cv2.circle(frame, (ix, iy), 3, (0, 255, 255), -1, cv2.LINE_AA)
                 cv2.circle(frame, (ix, iy), 6, (0, 200, 255), 1, cv2.LINE_AA)
 
-    def draw_hud(self, frame, tracker, left_score, right_score, landmarks, fps, sound_enabled, is_calibrating=False):
+        # Outer Lips Contour (Neon Magenta)
+        outer_lip_pts = [(int(face[i].x * w), int(face[i].y * h)) for i in LIPS_OUTER if i < len(face)]
+        if len(outer_lip_pts) > 2:
+            cv2.polylines(frame, [np.array(outer_lip_pts, np.int32)], isClosed=True, color=(220, 110, 255), thickness=1, lineType=cv2.LINE_AA)
+
+        # Inner Lips Contour
+        inner_lip_pts = [(int(face[i].x * w), int(face[i].y * h)) for i in LIPS_INNER if i < len(face)]
+        if len(inner_lip_pts) > 2:
+            cv2.polylines(frame, [np.array(inner_lip_pts, np.int32)], isClosed=True, color=(255, 170, 220), thickness=1, lineType=cv2.LINE_AA)
+
+    def draw_hud(self, frame, tracker, left_score, right_score, jaw_score, landmarks, fps, sound_enabled, is_calibrating=False):
         """Composes complete heads-up display overlay."""
         h, w = frame.shape[:2]
 
@@ -389,7 +499,7 @@ class HUDDrawer:
         # Top Header Bar
         # ----------------------------------------------------------------------
         self.draw_glass_card(frame, 0, 0, w, 50, bg_color=(12, 15, 22), alpha=0.88, border_color=None)
-        cv2.putText(frame, "EYE BLINK TRACKER AI", (20, 32), cv2.FONT_HERSHEY_DUPLEX, 0.72, COLOR_TEXT_WHITE, 1, cv2.LINE_AA)
+        cv2.putText(frame, "EYE BLINK & YAWN TRACKER AI", (20, 32), cv2.FONT_HERSHEY_DUPLEX, 0.70, COLOR_TEXT_WHITE, 1, cv2.LINE_AA)
 
         # Status Badges
         face_detected = landmarks is not None and len(landmarks) > 0
@@ -403,93 +513,148 @@ class HUDDrawer:
         cv2.putText(frame, fps_text, (w - 75, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_ACCENT_CYAN, 1, cv2.LINE_AA)
 
         # ----------------------------------------------------------------------
-        # Left Panel: Blink Counter Card
+        # Left Panel 1: Blink Counter Card
         # ----------------------------------------------------------------------
         card_w = 230
-        card_h = 165
-        cx1, cy1 = 20, 65
-        cx2, cy2 = cx1 + card_w, cy1 + card_h
+        cx1, cy1 = 20, 62
+        cx2, cy2 = cx1 + card_w, cy1 + 120
 
         # Pulse effect when blink occurs
         if tracker.pulse_frames > 0:
             border_c = COLOR_ACCENT_CYAN
             card_bg = (35, 50, 60)
-            glow_thickness = 2
+            glow = True
         else:
             border_c = COLOR_BORDER
             card_bg = COLOR_BG_CARD
-            glow_thickness = 1
+            glow = False
 
         self.draw_glass_card(frame, cx1, cy1, cx2, cy2, bg_color=card_bg, alpha=0.82, border_color=border_c)
-        if glow_thickness > 1:
+        if glow:
             cv2.rectangle(frame, (cx1 - 1, cy1 - 1), (cx2 + 1, cy2 + 1), COLOR_ACCENT_CYAN, 1, cv2.LINE_AA)
 
-        cv2.putText(frame, "TOTAL BLINKS", (cx1 + 16, cy1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.48, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+        cv2.putText(frame, "TOTAL BLINKS", (cx1 + 16, cy1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.44, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
 
         # Big Number
         blinks_str = str(tracker.total_blinks)
-        font_scale = 1.6 if tracker.pulse_frames > 0 else 1.5
+        font_scale = 1.5 if tracker.pulse_frames > 0 else 1.4
         count_color = (255, 255, 255) if tracker.pulse_frames > 0 else COLOR_ACCENT_CYAN
-        cv2.putText(frame, blinks_str, (cx1 + 16, cy1 + 82), cv2.FONT_HERSHEY_DUPLEX, font_scale, count_color, 2, cv2.LINE_AA)
+        cv2.putText(frame, blinks_str, (cx1 + 16, cy1 + 68), cv2.FONT_HERSHEY_DUPLEX, font_scale, count_color, 2, cv2.LINE_AA)
 
         # Sub-stats: Winks
-        cv2.line(frame, (cx1 + 15, cy1 + 105), (cx2 - 15, cy1 + 105), (50, 60, 80), 1)
-        winks_str = f"L-Winks: {tracker.left_winks}    R-Winks: {tracker.right_winks}"
-        cv2.putText(frame, winks_str, (cx1 + 16, cy1 + 130), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+        winks_str = f"L-Wink: {tracker.left_winks}  R-Wink: {tracker.right_winks}"
+        cv2.putText(frame, winks_str, (cx1 + 16, cy1 + 92), cv2.FONT_HERSHEY_SIMPLEX, 0.38, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
 
-        # Status string: e.g., Blinking / Eyes Open
+        # State tag
         state_tag = "BLINKING" if tracker.is_eyes_closed else "EYES OPEN"
         state_c = COLOR_ACCENT_YELLOW if tracker.is_eyes_closed else COLOR_ACCENT_GREEN
-        cv2.putText(frame, state_tag, (cx1 + 16, cy1 + 150), cv2.FONT_HERSHEY_SIMPLEX, 0.38, state_c, 1, cv2.LINE_AA)
+        cv2.putText(frame, state_tag, (cx1 + 16, cy1 + 110), cv2.FONT_HERSHEY_SIMPLEX, 0.36, state_c, 1, cv2.LINE_AA)
 
         # ----------------------------------------------------------------------
-        # Real-time Eye Gauges (Left & Right Eye Openness)
+        # Left Panel 2: Yawn Counter Card
         # ----------------------------------------------------------------------
-        gauge_y = cy2 + 15
-        gauge_h = 100
+        ycard_y1 = cy2 + 10
+        ycard_y2 = ycard_y1 + 92
+
+        if not tracker.yawn_enabled:
+            yborder_c = (50, 55, 65)
+            ycard_bg = (18, 20, 26)
+            yglow = False
+        elif tracker.yawn_pulse_frames > 0 or tracker.is_yawning:
+            yborder_c = (220, 110, 255)  # Neon Purple
+            ycard_bg = (55, 25, 65)
+            yglow = True
+        else:
+            yborder_c = COLOR_BORDER
+            ycard_bg = COLOR_BG_CARD
+            yglow = False
+
+        self.draw_glass_card(frame, cx1, ycard_y1, cx2, ycard_y2, bg_color=ycard_bg, alpha=0.82, border_color=yborder_c)
+        if yglow:
+            cv2.rectangle(frame, (cx1 - 1, ycard_y1 - 1), (cx2 + 1, ycard_y2 + 1), (220, 110, 255), 1, cv2.LINE_AA)
+
+        cv2.putText(frame, "TOTAL YAWNS", (cx1 + 16, ycard_y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.44, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+
+        if not tracker.yawn_enabled:
+            cv2.putText(frame, "OFF", (cx1 + 16, ycard_y1 + 65), cv2.FONT_HERSHEY_DUPLEX, 1.2, (100, 105, 120), 2, cv2.LINE_AA)
+            cv2.putText(frame, "Press [Y] to Enable", (cx1 + 16, ycard_y1 + 83), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (120, 125, 140), 1, cv2.LINE_AA)
+        else:
+            yawns_str = str(tracker.total_yawns)
+            yawn_c = (255, 255, 255) if tracker.yawn_pulse_frames > 0 else (220, 130, 255)
+            cv2.putText(frame, yawns_str, (cx1 + 16, ycard_y1 + 65), cv2.FONT_HERSHEY_DUPLEX, 1.3, yawn_c, 2, cv2.LINE_AA)
+
+            if tracker.is_yawning:
+                ystatus_text = "YAWNING!"
+                ystatus_c = (220, 110, 255)
+            else:
+                ystatus_text = f"ACTIVE (Thresh: {int(tracker.yawn_threshold * 100)}%)"
+                ystatus_c = COLOR_ACCENT_GREEN
+            cv2.putText(frame, ystatus_text, (cx1 + 16, ycard_y1 + 83), cv2.FONT_HERSHEY_SIMPLEX, 0.36, ystatus_c, 1, cv2.LINE_AA)
+
+        # ----------------------------------------------------------------------
+        # Left Panel 3: Real-time Eye & Jaw Openness Gauges
+        # ----------------------------------------------------------------------
+        gauge_y = ycard_y2 + 10
+        gauge_h = 125
         self.draw_glass_card(frame, cx1, gauge_y, cx2, gauge_y + gauge_h, bg_color=COLOR_BG_CARD, alpha=0.82)
-        cv2.putText(frame, "EYE OPENNESS", (cx1 + 16, gauge_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.44, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+        cv2.putText(frame, "FACIAL OPENNESS", (cx1 + 16, gauge_y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
 
-        # Openness = 1.0 - closure_score
+        # Eye Openness = 1.0 - closure_score
         left_openness = 1.0 - (left_score if left_score is not None else 0.0)
         right_openness = 1.0 - (right_score if right_score is not None else 0.0)
+        mouth_val = jaw_score if jaw_score is not None else 0.0
 
-        self.draw_progress_bar(frame, cx1 + 16, gauge_y + 44, 195, 12, left_openness, "Left Eye")
-        self.draw_progress_bar(frame, cx1 + 16, gauge_y + 76, 195, 12, right_openness, "Right Eye")
+        self.draw_progress_bar(frame, cx1 + 16, gauge_y + 38, 195, 10, left_openness, "Left Eye")
+        self.draw_progress_bar(frame, cx1 + 16, gauge_y + 66, 195, 10, right_openness, "Right Eye")
+
+        # Mouth openness bar with custom color & threshold mark
+        if not tracker.yawn_enabled:
+            mouth_col = (90, 90, 100)
+            mouth_lbl = "Mouth (Disabled)"
+            thresh_mark = None
+        elif mouth_val >= tracker.yawn_threshold:
+            mouth_col = (220, 110, 255)  # Neon Purple
+            mouth_lbl = f"Mouth (YAWN ZONE {int(mouth_val * 100)}%)"
+            thresh_mark = tracker.yawn_threshold
+        elif mouth_val >= 0.20:
+            mouth_col = COLOR_ACCENT_YELLOW
+            mouth_lbl = f"Mouth (Speaking {int(mouth_val * 100)}%)"
+            thresh_mark = tracker.yawn_threshold
+        else:
+            mouth_col = COLOR_ACCENT_CYAN
+            mouth_lbl = f"Mouth (Resting {int(mouth_val * 100)}%)"
+            thresh_mark = tracker.yawn_threshold
+
+        self.draw_progress_bar(
+            frame, cx1 + 16, gauge_y + 94, 195, 10, mouth_val, mouth_lbl,
+            custom_color=mouth_col,
+            threshold_pos=thresh_mark
+        )
 
         # ----------------------------------------------------------------------
-        # Right Panel: Ergonomics & Health Insights
+        # Right Panel: Ergonomics, Health & Drowsiness
         # ----------------------------------------------------------------------
         rcard_w = 230
-        rcard_h = 165
+        rcard_h = 175
         rx2 = w - 20
         rx1 = rx2 - rcard_w
-        ry1 = 65
+        ry1 = 62
         ry2 = ry1 + rcard_h
 
         self.draw_glass_card(frame, rx1, ry1, rx2, ry2, bg_color=COLOR_BG_CARD, alpha=0.82)
-        cv2.putText(frame, "ERGONOMICS & HEALTH", (rx1 + 16, ry1 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.44, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+        cv2.putText(frame, "ALERTNESS & HEALTH", (rx1 + 16, ry1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.44, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
 
         bpm = tracker.get_bpm()
         bpm_str = f"{bpm}"
-        cv2.putText(frame, bpm_str, (rx1 + 16, ry1 + 68), cv2.FONT_HERSHEY_DUPLEX, 1.2, COLOR_TEXT_WHITE, 2, cv2.LINE_AA)
-        cv2.putText(frame, "Blinks / Min", (rx1 + 95, ry1 + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+        cv2.putText(frame, bpm_str, (rx1 + 16, ry1 + 64), cv2.FONT_HERSHEY_DUPLEX, 1.2, COLOR_TEXT_WHITE, 2, cv2.LINE_AA)
+        cv2.putText(frame, "Blinks / Min", (rx1 + 95, ry1 + 61), cv2.FONT_HERSHEY_SIMPLEX, 0.44, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
 
-        # Health assessment indicator
-        if bpm >= 14:
-            health_text = "Optimal Rate"
-            health_c = COLOR_ACCENT_GREEN
-        elif bpm >= 9:
-            health_text = "Moderate (Rest Eyes)"
-            health_c = COLOR_ACCENT_YELLOW
-        else:
-            health_text = "Low Rate (Fatigue)"
-            health_c = COLOR_ACCENT_RED
+        # Drowsiness / Fatigue Assessment
+        drowsy_text, drowsy_color = tracker.get_drowsiness_status()
+        cv2.circle(frame, (rx1 + 22, ry1 + 88), 4, drowsy_color, -1, cv2.LINE_AA)
+        cv2.putText(frame, drowsy_text, (rx1 + 32, ry1 + 92), cv2.FONT_HERSHEY_SIMPLEX, 0.38, drowsy_color, 1, cv2.LINE_AA)
 
-        cv2.circle(frame, (rx1 + 22, ry1 + 92), 4, health_c, -1, cv2.LINE_AA)
-        cv2.putText(frame, health_text, (rx1 + 32, ry1 + 96), cv2.FONT_HERSHEY_SIMPLEX, 0.40, health_c, 1, cv2.LINE_AA)
-
-        cv2.line(frame, (rx1 + 15, ry1 + 110), (rx2 - 15, ry1 + 110), (50, 60, 80), 1)
+        cv2.line(frame, (rx1 + 15, ry1 + 108), (rx2 - 15, ry1 + 108), (50, 60, 80), 1)
 
         # Time since last blink
         time_since = tracker.get_time_since_last_blink()
@@ -499,13 +664,43 @@ class HUDDrawer:
         # Session Time
         elapsed_sec = int(time.time() - tracker.session_start)
         elapsed_str = f"Session: {elapsed_sec // 60:02d}:{elapsed_sec % 60:02d}"
-        cv2.putText(frame, elapsed_str, (rx1 + 16, ry1 + 150), cv2.FONT_HERSHEY_SIMPLEX, 0.40, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
+        cv2.putText(frame, elapsed_str, (rx1 + 16, ry1 + 154), cv2.FONT_HERSHEY_SIMPLEX, 0.40, COLOR_TEXT_DIM, 1, cv2.LINE_AA)
 
         # ----------------------------------------------------------------------
-        # Dry-Eye / Stare Alert Banner (If user hasn't blinked for > 12s)
+        # Center Alerts (Yawn Detected or Dry-Eye Stare Warning)
         # ----------------------------------------------------------------------
-        if face_detected and time_since >= STARE_ALERT_SECONDS:
-            # Pulsing warning banner in upper center
+        now = time.time()
+        is_holding_yawn = (tracker.yawn_enabled and mouth_val >= tracker.yawn_threshold and
+                           tracker.yawn_start_time is not None and not tracker.already_counted_yawn)
+
+        if is_holding_yawn:
+            # Show live hold countdown
+            hold_sec = min(tracker.min_yawn_hold_sec, now - tracker.yawn_start_time)
+            banner_w = 360
+            banner_h = 44
+            bx1 = (w - banner_w) // 2
+            by1 = 65
+            bx2 = bx1 + banner_w
+            by2 = by1 + banner_h
+            self.draw_glass_card(frame, bx1, by1, bx2, by2, bg_color=(50, 20, 65), alpha=0.92, border_color=(220, 110, 255))
+            cv2.putText(frame, f"O  YAWNING... ({hold_sec:.1f}s / {tracker.min_yawn_hold_sec:.1f}s)", (bx1 + 20, by1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2, cv2.LINE_AA)
+
+        elif tracker.is_yawning and tracker.yawn_enabled:
+            # Pulsing Yawn Alert Banner
+            banner_w = 340
+            banner_h = 44
+            bx1 = (w - banner_w) // 2
+            by1 = 65
+            bx2 = bx1 + banner_w
+            by2 = by1 + banner_h
+
+            pulse = int(abs(math.sin(time.time() * 5.0)) * 60)
+            alert_bg = (40 + pulse, 15, 60 + pulse)
+            self.draw_glass_card(frame, bx1, by1, bx2, by2, bg_color=alert_bg, alpha=0.92, border_color=(220, 110, 255))
+            cv2.putText(frame, "O  YAWN CONFIRMED !", (bx1 + 50, by1 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2, cv2.LINE_AA)
+
+        elif face_detected and time_since >= STARE_ALERT_SECONDS:
+            # Pulsing Dry-Eye Banner
             banner_w = 340
             banner_h = 44
             bx1 = (w - banner_w) // 2
@@ -547,32 +742,35 @@ class HUDDrawer:
         snd_label = "ON" if sound_enabled else "OFF"
         mesh_label = "ON" if self.show_mesh else "OFF"
         graph_label = "ON" if self.show_graph else "OFF"
+        yawn_label = f"ON ({int(tracker.yawn_threshold*100)}%)" if tracker.yawn_enabled else "OFF"
 
-        help_bar = f"[R] Reset   [S] Sound: {snd_label}   [M] Mesh: {mesh_label}   [G] Graph: {graph_label}   [C] Calibrate   [H] Help   [Q] Exit"
-        cv2.putText(frame, help_bar, (20, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.44, COLOR_TEXT_WHITE, 1, cv2.LINE_AA)
+        help_bar = f"[R] Reset  [S] Sound: {snd_label}  [M] Mesh: {mesh_label}  [Y] Yawn: {yawn_label}  [-/+] Sensitivity  [H] Help  [Q] Exit"
+        cv2.putText(frame, help_bar, (20, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_TEXT_WHITE, 1, cv2.LINE_AA)
 
         # ----------------------------------------------------------------------
         # Help Modal (Toggled with 'H')
         # ----------------------------------------------------------------------
         if self.show_help:
-            hw, hh = 440, 240
+            hw, hh = 460, 270
             hx1, hy1 = (w - hw) // 2, (h - hh) // 2
             self.draw_glass_card(frame, hx1, hy1, hx1 + hw, hy1 + hh, bg_color=(15, 18, 28), alpha=0.94, border_color=COLOR_ACCENT_CYAN)
             cv2.putText(frame, "KEYBOARD SHORTCUTS", (hx1 + 20, hy1 + 35), cv2.FONT_HERSHEY_DUPLEX, 0.65, COLOR_TEXT_WHITE, 1, cv2.LINE_AA)
 
             lines = [
                 ("R", "Reset all counters and session timer"),
-                ("S", "Toggle sound feedback on blink / wink"),
-                ("M", "Toggle face & eye landmark contours"),
+                ("S", "Toggle sound feedback on blink / wink / yawn"),
+                ("M", "Toggle face, eye & lip landmark contours"),
                 ("G", "Toggle real-time eyelid dynamics graph"),
-                ("C", "Run 3-second sensitivity auto-calibration"),
+                ("Y", "Toggle yawn detection ON / OFF"),
+                ("- / +", "Decrease / increase yawn sensitivity threshold"),
+                ("C", "Run 3-second eye sensitivity auto-calibration"),
                 ("H", "Show / hide this help panel"),
                 ("Q / ESC", "Quit the application")
             ]
             for idx, (key, desc) in enumerate(lines):
-                ly = hy1 + 65 + idx * 24
-                cv2.putText(frame, f"[{key}]", (hx1 + 25, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.44, COLOR_ACCENT_CYAN, 1, cv2.LINE_AA)
-                cv2.putText(frame, desc, (hx1 + 110, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_TEXT_WHITE, 1, cv2.LINE_AA)
+                ly = hy1 + 62 + idx * 22
+                cv2.putText(frame, f"[{key}]", (hx1 + 25, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_ACCENT_CYAN, 1, cv2.LINE_AA)
+                cv2.putText(frame, desc, (hx1 + 115, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.40, COLOR_TEXT_WHITE, 1, cv2.LINE_AA)
 
 
 # ==============================================================================
@@ -691,6 +889,7 @@ def main():
 
             left_score = None
             right_score = None
+            raw_jaw_score = None
             landmarks = detection_result.face_landmarks
 
             # Extract blendshapes
@@ -698,6 +897,10 @@ def main():
                 shapes = {c.category_name: c.score for c in detection_result.face_blendshapes[0]}
                 left_score = shapes.get('eyeBlinkLeft', 0.0)
                 right_score = shapes.get('eyeBlinkRight', 0.0)
+                raw_jaw_score = shapes.get('jawOpen', 0.0)
+
+            # Compute combined Mouth Aspect Ratio (MAR) + jawOpen
+            mouth_score, mar = compute_mouth_metrics(landmarks, raw_jaw_score)
 
             # Calibration handling
             if calibrator.active:
@@ -706,9 +909,12 @@ def main():
                     tracker.close_threshold, tracker.open_threshold = new_thresholds
 
             # Update Tracker state
-            event = tracker.update(left_score, right_score)
+            event = tracker.update(left_score, right_score, mouth_score)
             if event == "BLINK":
                 sound.play('blink')
+            elif event == "YAWN":
+                sound.play('yawn')
+                print(f"[Event] Yawn #{tracker.total_yawns} detected! (Mouth: {int(mouth_score * 100)}%)")
             elif event in ("LEFT_WINK", "RIGHT_WINK"):
                 sound.play('wink')
 
@@ -718,6 +924,7 @@ def main():
                 tracker=tracker,
                 left_score=left_score,
                 right_score=right_score,
+                jaw_score=mouth_score,
                 landmarks=landmarks,
                 fps=fps,
                 sound_enabled=sound.enabled,
@@ -741,6 +948,15 @@ def main():
             elif key in (ord('m'), ord('M')):
                 hud.show_mesh = not hud.show_mesh
                 print(f"[Action] Mesh overlay: {'ON' if hud.show_mesh else 'OFF'}")
+            elif key in (ord('y'), ord('Y')):
+                tracker.yawn_enabled = not tracker.yawn_enabled
+                print(f"[Action] Yawn detection: {'ON' if tracker.yawn_enabled else 'OFF'}")
+            elif key in (ord('-'), ord('_')):
+                tracker.yawn_threshold = max(0.24, round(tracker.yawn_threshold - 0.02, 2))
+                print(f"[Action] Yawn threshold decreased: {int(tracker.yawn_threshold * 100)}%")
+            elif key in (ord('='), ord('+')):
+                tracker.yawn_threshold = min(0.70, round(tracker.yawn_threshold + 0.02, 2))
+                print(f"[Action] Yawn threshold increased: {int(tracker.yawn_threshold * 100)}%")
             elif key in (ord('g'), ord('G')):
                 hud.show_graph = not hud.show_graph
                 print(f"[Action] Graph: {'ON' if hud.show_graph else 'OFF'}")

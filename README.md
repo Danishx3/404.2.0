@@ -1,36 +1,59 @@
-# 👁️ Eye Blink Tracker AI
+# 👁️ Ocular AI — Blink & Yawn Ergonomics Tracker
+### *Windows Desktop Application Edition*
 
-An AI-powered eye blink counter and ocular health monitor built in Python using **Google MediaPipe FaceLandmarker** and **OpenCV**. Features a real-time cyberpunk/glassmorphic Heads-Up Display (HUD), real-time ocular dynamics graphs, blink rate tracking, and dry-eye fatigue alerts.
+An AI-powered ocular ergonomics and fatigue monitoring desktop application built in Python using **Google MediaPipe FaceLandmarker**, **CustomTkinter**, and **SQLite**.
 
 ---
 
 ## ✨ Features
 
-- **🎯 Precision Blink & Wink Tracking**: Uses MediaPipe's neural facial blendshapes (`eyeBlinkLeft` & `eyeBlinkRight`) with state machine hysteresis and debouncing to eliminate false triggers from jitters or head movements.
-- **😉 Isolated Wink Detection**: Distinctly identifies and tracks **Left Winks** and **Right Winks** separate from bilateral eye blinks.
-- **📊 Ergonomics & Health Insights (BPM)**: Calculates live **Blinks Per Minute (BPM)** to monitor screen fatigue (healthy rate: 15–20 BPM).
-- **⚠️ Dry-Eye / Stare Alert**: Prominently warns users with an animated banner if they haven't blinked for > 12 seconds while staring at the screen.
-- **📈 Rolling Sparkline Dynamics Graph**: Real-time 90-frame waveform of eyelid closure with an interactive threshold line.
-- **🔮 Cyber Glassmorphic HUD**: High-tech translucent overlay with live eye openness progress gauges, big counter with pulse glow on each blink, and session timers.
-- **🔊 Non-Blocking Audio Cues**: Subdued audio clicks/blips on blinks and winks using background threads (zero camera lag).
-- **📐 3-Second Auto-Calibration**: Press `C` to adapt thresholds automatically for different lighting conditions, glasses, or eye shapes.
-- **🕸️ Eye & Iris Mesh Visualization**: Toggleable contours around eyelids and pupil centers.
+- **🖥️ Modern Windows Desktop GUI**: Built with CustomTkinter featuring a sleek dark-mode interface, embedded live 30 FPS webcam feed, responsive cards, and multi-tab navigation.
+- **💾 Local SQLite Data Storage**: Automatically logs every tracking session to `data/blink_history.db`. Displays session history, duration, blinks, yawns, and average BPM with one-click **Export to CSV**.
+- **🎯 Precision Blink & Wink Tracking**: Uses neural blendshapes (`eyeBlinkLeft`, `eyeBlinkRight`) with hysteresis debouncing (40ms – 600ms) to eliminate false triggers.
+- **🥱 Speech-Immune Yawn Engine**: Distinguishes true deep yawns from conversational speech by pairing geometric **Mouth Aspect Ratio (MAR)** with a 58% threshold and 1.3s continuous hold requirement.
+- **😴 Alertness & Drowsiness Index**: Evaluates blink rate and yawn frequency to determine fatigue levels (`ALERT & ATTENTIVE`, `TIRED`, or `DROWSY - Take a break!`).
+- **📈 Real-Time Gauges & Waveforms**: Live progress bars for Left Eye, Right Eye, and Mouth Openness with dynamic threshold markers.
+- **🔊 Non-Blocking Audio Cues**: Distinct audio blips on blinks/winks and gentle chimes on yawns.
+- **🚀 Native Windows Packaging**:
+  - Desktop Shortcut on your Windows Desktop: **`Ocular AI - Blink & Yawn Tracker.lnk`**
+  - **`app.pyw`**: Windowed mode without command prompt window.
+  - **`Launch_App.bat`**: Instant one-click runner.
+  - **`build_exe.bat`**: Compiles a standalone `.exe` with PyInstaller.
 
 ---
 
-## 🚀 Quickstart
+## 🚀 How to Launch the Application
 
-### 1. Requirements
-Ensure dependencies are installed:
-```powershell
-pip install opencv-python mediapipe numpy
-```
+### Option 1: Desktop Shortcut (Recommended)
+Double-click the **`Ocular AI - Blink & Yawn Tracker`** shortcut on your Windows Desktop!
 
-### 2. Launch the Application
-Run the Python script directly from your terminal:
+### Option 2: One-Click Batch Launcher
+Double-click **`Launch_App.bat`** in this folder.
+
+### Option 3: Terminal Command
 ```powershell
-python blink_counter.py
+python gui_app.py
 ```
+*(Or use `pythonw app.pyw` to run without a background terminal)*
+
+---
+
+## 📑 Application Tabs
+
+1. **🖥️ Live Monitor**:
+   - Live camera stream with optional mesh contours.
+   - Large live counters for Blinks, Yawns, and Winks.
+   - Real-time BPM gauge, fatigue indicator, and eye/mouth openness bars.
+   - Interactive buttons: Pause/Resume Camera, Toggle Mesh, Toggle Sound, Reset Session.
+2. **📊 History & Analytics**:
+   - Lifetime summary cards (Lifetime Blinks, Lifetime Yawns, Total Hours Tracked, Average BPM).
+   - Scrollable history table of past sessions.
+   - **`Export to CSV`** button for Excel analysis.
+3. **⚙️ Settings**:
+   - Camera device index selector (0, 1, 2).
+   - Yawn threshold & hold duration sliders.
+   - Blink sensitivity sliders.
+   - Audio and Auto-save preferences.
 
 > **Note**: The neural model (`face_landmarker.task`) is already included in this repository. If run on a new computer, it will automatically download from Google's official CDN on first launch.
 
@@ -40,10 +63,12 @@ python blink_counter.py
 
 | Key | Action |
 |---|---|
-| `R` | **Reset** counter, winks, and session timers |
+| `R` | **Reset** blinks, yawns, winks, and session timers |
 | `S` | **Toggle Sound** feedback (ON / OFF) |
-| `M` | **Toggle Mesh** visualization for eye contours and pupils |
+| `M` | **Toggle Mesh** visualization (eyes, pupils, and neon lip contours) |
 | `G` | **Toggle Graph** for real-time eyelid dynamics waveform |
+| `Y` | **Toggle Yawn Detection** (ON / OFF) |
+| `-` / `+` | **Decrease / Increase Yawn Sensitivity** threshold |
 | `C` | **Auto-Calibrate** eye sensitivity (3-second calibration) |
 | `H` | **Toggle Help** shortcuts overlay |
 | `Q` / `ESC` | **Quit** the application |
@@ -52,10 +77,15 @@ python blink_counter.py
 
 ## 🧠 How It Works
 
-1. **Neural Inference**: Each camera frame is passed to MediaPipe's `FaceLandmarker` running lightweight on-device CPU inference.
-2. **Blendshape Extraction**: Extracts continuous `eyeBlinkLeft` and `eyeBlinkRight` scores between `0.0` (wide open) and `1.0` (fully shut).
-3. **State Machine & Debouncing**:
-   - Eyes must cross the closure threshold (`~0.48`) to initiate a closure state.
-   - Eyes must reopen past the opening threshold (`~0.22`) within a realistic human blink duration window (40ms – 600ms) to increment the blink counter.
-   - Prolonged closure (sleeping or resting eyes) is ignored and not repeatedly counted.
-4. **Ergonomic Rate Analysis**: Maintains a rolling 60-second time-series buffer of blink timestamps to calculate instantaneous BPM.
+1. **Neural Inference**: Each camera frame is passed to MediaPipe's `FaceLandmarker` running on-device CPU inference.
+2. **Hybrid Eye & Mouth Feature Extraction**:
+   - **Blinks**: Neural blendshapes (`eyeBlinkLeft`, `eyeBlinkRight`) with hysteresis debouncing (40ms – 600ms).
+   - **Yawns**: Ensemble of geometric **Mouth Aspect Ratio (MAR)** (inner lip distances) + neural `jawOpen` blendshape score.
+3. **Speech-Immune Yawn Engine**:
+   - **Speech Rejection**: Conversational speech (mouth opening ~15%–35%) never reaches the yawn threshold (`58%`).
+   - **Continuous Hold Requirement**: To prevent syllables and vowels from accumulating, the mouth must be held wide open continuously (`>= 58%`) for **`>= 1.30 seconds`**.
+   - **Instant Flutter Reset**: If the mouth moves or dips below 58% during speech articulation, the hold timer immediately resets to zero.
+   - **Live Hold Countdown**: While yawning, the HUD displays a live progress counter: `😮 YAWNING... (0.8s / 1.3s)` so you can see the system validating the hold in real time.
+4. **Ergonomic Rate & Fatigue Analysis**:
+   - Rolling 60-second time-series buffer of blinks calculates real-time **BPM**.
+   - Cross-analyzes yawns and blink rates to evaluate fatigue (`ALERT`, `TIRED`, `DROWSY`).
