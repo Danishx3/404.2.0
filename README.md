@@ -74,10 +74,10 @@ pip install -r requirements.txt
 ![Screenshot1](img1.png)
 The Live Monitor dashboard displaying real-time webcam feed, blink/yawn counters, BPM health gauge, and facial dynamics progress bars.
 
-![Screenshot2](img2.png)
+![Screenshot2](img3.png)
 Speech-immune yawn detection in action with real-time continuous hold progress bar and face mesh overlay.
 
-![Screenshot3](img3.png)
+![Screenshot3](img2.png)
 History & Analytics dashboard featuring lifetime aggregate statistics, session log table, CSV export, and clear history controls.
 
 # Diagrams
