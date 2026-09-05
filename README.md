@@ -1,4 +1,4 @@
-<img width="1280" alt="readme-banner" src="https://github.com/user-attachments/assets/35332e92-44cb-425b-9dff-27bcf1023c6c">
+<img width="1280" height="640" alt="git (1)" src="https://github.com/user-attachments/assets/8920b256-2ba8-4988-b824-5351134eb4bd" />
 
 # Ocular AI. 🎯
 
@@ -49,7 +49,7 @@ pip install -r requirements.txt
 # Run
 - Double-click `Launch_App.bat` or the desktop shortcut
 - Or run in terminal: `python gui_app.py`
-- Or run windowed mode (no console): `pythonw app.pyw`
+- Or run windowed mode (no console): `python app.pyw`
 - Or run the classic HUD mode: `python blink_counter.py`
 
 ### Project Documentation
